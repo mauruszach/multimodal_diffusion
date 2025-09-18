@@ -1,0 +1,28 @@
+# Core
+numpy>=1.21.0
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Data Processing
+h5py>=3.7.0
+numpy>=1.21.0
+pandas>=1.3.0
+scipy>=1.7.0
+soundfile>=0.10.3
+webdataset>=0.2.5
+
+# Deep Learning
+transformers>=4.30.0
+datasets>=2.10.0
+accelerate>=0.20.0
+
+# Utilities
+tqdm>=4.65.0
+pyyaml>=6.0
+matplotlib>=3.5.0
+wandb>=0.15.0
+
+# Testing
+pytest>=7.0.0
+pytest-cov>=4.0.0

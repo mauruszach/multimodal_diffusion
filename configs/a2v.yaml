@@ -1,0 +1,41 @@
+# ========= av_diffusion : Inference (Audio -> Video) =========
+# Version: 1.0.0  # Follows semantic versioning (MAJOR.MINOR.PATCH)
+experiment: "av_infer_a2v"
+seed: 42
+device: "cuda"
+mixed_precision: "bf16"  # Should match training config
+
+# Where to write outputs and which checkpoint to load
+# Supports environment variables with ${VAR_NAME} syntax
+paths:
+  samples_dir: "${OUTPUT_DIR:-runs/a2v}/samples"
+  ckpt_path: "${CHECKPOINT_DIR:-runs/av_mvp/checkpoints}/av_mvp_latest.pt"
+
+# Sampling direction
+sampling:
+  prompt_modality: "audio"     # provide audio; generate video
+  ddim_eta: 0.0
+  guidance_scale:
+    video: 3.5                 # guidance only matters for the TARGET (video here)
+    audio: 0.0                 # unused (we aren't generating audio)
+
+# Sampler detail
+diffusion:
+  video:
+    sampler_steps: 60          # you can bump steps a bit for better visuals
+  audio:
+    sampler_steps: 50          # unused here
+
+# Streaming (optional)
+streaming:
+  enabled: false               # set true to do long-form generation with sliding windows
+  window_seconds: 3.0
+  hop_seconds: 1.0
+  crossfade_seconds: 0.25
+
+# I/O hints your script can use
+io:
+  input_audio_path: ""         # set at runtime or via CLI (e.g., --audio path.wav)
+  output_video_path: ""        # set at runtime; your script can default based on samples_dir
+  fps: 16
+  size: [128, 128]

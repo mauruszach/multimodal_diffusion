@@ -1,0 +1,35 @@
+# ========= av_diffusion : Inference (Video -> Audio) =========
+# Version: 1.0.0  # Follows semantic versioning (MAJOR.MINOR.PATCH)
+experiment: "av_infer_v2a"
+seed: 42
+device: "cuda"
+mixed_precision: "bf16"  # Should match training config
+
+# Paths support environment variables with ${VAR_NAME} syntax
+paths:
+  samples_dir: "${OUTPUT_DIR:-runs/v2a}/samples"
+  ckpt_path: "${CHECKPOINT_DIR:-runs/av_mvp/checkpoints}/av_mvp_latest.pt"
+
+sampling:
+  prompt_modality: "video"     # provide video; generate audio
+  ddim_eta: 0.0
+  guidance_scale:
+    audio: 3.5                 # guidance for TARGET (audio here)
+    video: 0.0
+
+diffusion:
+  audio:
+    sampler_steps: 60
+  video:
+    sampler_steps: 50          # unused here
+
+streaming:
+  enabled: false
+  window_seconds: 3.0
+  hop_seconds: 1.0
+  crossfade_seconds: 0.0
+
+io:
+  input_frames_dir: ""         # set at runtime (path to frames or a video file your script decodes)
+  output_audio_path: ""        # set at runtime (e.g., samples_dir/clip.wav)
+  sr: 16000
