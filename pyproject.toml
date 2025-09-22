@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "avdiff"
+version = "0.1.0"
+description = "Audio-Video diffusion MVP"
+readme = "README.md"
+requires-python = ">=3.9"
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["avdiff*"]
+exclude = ["tests*","scripts*","tools*","data*","runs*"]

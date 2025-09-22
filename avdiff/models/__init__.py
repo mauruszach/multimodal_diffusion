@@ -1,35 +1,12 @@
-# Main model imports
-from .modules.mmdt import MultimodalDiffusionTransformer
-from .modules.vae_image import ImageVAE
-from .modules.vae_audio import AudioVAE
-from .modules.encoder_smell import SmellEncoder
-from .modules.conditioning import ModalityEmbedding, TimestepEmbedding
-from .modules.noise_schedules import get_named_beta_schedule
-from .modules.adapters import (
-    ProjectionAdapter,
-    TokenLearner,
-    TokenLearnerModule
-)
+# Keep this package init minimal to avoid import-order issues.
+# Do NOT import heavy modules here.
 
-# Model heads
-from .heads.noise_heads import (
-    NoisePredictionHead,
-    MultiModalNoiseHead
-)
-from .heads.graph_diffusion_head import GraphDiffusionHead
+__all__ = []  # optionally re-export selectively below
 
-__all__ = [
-    'MultimodalDiffusionTransformer',
-    'ImageVAE',
-    'AudioVAE',
-    'SmellEncoder',
-    'ModalityEmbedding',
-    'TimestepEmbedding',
-    'get_named_beta_schedule',
-    'ProjectionAdapter',
-    'TokenLearner',
-    'TokenLearnerModule',
-    'NoisePredictionHead',
-    'MultiModalNoiseHead',
-    'GraphDiffusionHead'
-]
+# If you want convenience re-exports without breaking tests, keep them lazy:
+def __getattr__(name):
+    if name in {"NoisePredictionHead", "MultiModalNoiseHead"}:
+        from .heads.noise_heads import NoisePredictionHead, MultiModalNoiseHead
+        return {"NoisePredictionHead": NoisePredictionHead,
+                "MultiModalNoiseHead": MultiModalNoiseHead}[name]
+    raise AttributeError(name)

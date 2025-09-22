@@ -1,328 +1,200 @@
-#!/usr/bin/env python3
-"""
-schedule_utils.py — diffusion schedules, q_sample, and DDIM stepping.
-"""
-
 from __future__ import annotations
-from typing import Literal, Tuple
 
 import math
+from typing import Tuple
+
 import torch
+import torch.nn.functional as F
 
 
-ScheduleKind = Literal["linear", "cosine", "sigmoid"]
-
-
-# ---------------------------
+# ----------------------------
 # Beta schedules
-# ---------------------------
+# ----------------------------
 
-def make_beta_schedule(steps: int,
-                       kind: ScheduleKind = "cosine",
-                       min_beta: float = 1e-4,
-                       max_beta: float = 2e-2,
-                       s: float = 0.008) -> torch.Tensor:
+def make_beta_schedule(
+    steps: int,
+    kind: str = "cosine",
+    min_beta: float = 1e-4,
+    max_beta: float = 2e-2,
+) -> torch.Tensor:
     """
-    Create a beta schedule (length = steps).
+    Return betas[t] for t=0..steps-1.
 
-    - linear: linspace(min_beta, max_beta)
-    - cosine: Nichol & Dhariwal (improved DDPM) via alpha_bar(t)
-    - sigmoid: smooth start/end using a logistic in log-beta space
+    kind:
+      - "cosine": Nichol & Dhariwal 2021 (improved DDPM)
+      - "linear": linearly spaced betas between [min_beta, max_beta]
+      - "sigmoid": sigmoid ramp between [min_beta, max_beta]
     """
-    device = torch.device("cpu")
-
+    kind = kind.lower()
     if kind == "linear":
-        betas = torch.linspace(min_beta, max_beta, steps, device=device)
+        betas = torch.linspace(min_beta, max_beta, steps, dtype=torch.float32)
+        return betas.clamp(1e-8, 0.999)
 
-    elif kind == "cosine":
-        # alpha_bar(t) = cos^2( (t/T + s)/(1+s) * pi/2 )
-        ts = torch.linspace(0, steps, steps + 1, device=device)
-        f = (ts / steps + s) / (1 + s)
-        alpha_bar = torch.cos(f * math.pi / 2) ** 2
-        betas = torch.clamp(1 - (alpha_bar[1:] / alpha_bar[:-1]), min=min_beta, max=max_beta)
+    if kind == "sigmoid":
+        xs = torch.linspace(-6, 6, steps, dtype=torch.float32)
+        sig = torch.sigmoid(xs)
+        betas = min_beta + (max_beta - min_beta) * sig
+        return betas.clamp(1e-8, 0.999)
 
-    elif kind == "sigmoid":
-        # Interpolate betas in log-space with a sigmoid ramp
-        t = torch.linspace(-6, 6, steps, device=device)
-        sig = torch.sigmoid(t)
-        betas = (min_beta + (max_beta - min_beta) * sig)
+    if kind == "cosine":
+        # Follow Nichol & Dhariwal (https://arxiv.org/abs/2102.09672)
+        s = 0.008
+        t = torch.linspace(0, steps, steps + 1, dtype=torch.float32)  # 0..T
+        f = torch.cos(((t / steps + s) / (1 + s)) * math.pi / 2) ** 2
+        a_bar = f / f[0]  # normalize so that a_bar[0] = 1
+        betas = 1 - (a_bar[1:] / a_bar[:-1])
+        betas = betas.clamp(1e-8, 0.999)
+        return betas
 
-    else:
-        raise ValueError(f"Unknown schedule kind: {kind}")
-
-    return betas.float()
+    raise ValueError(f"Unknown schedule kind: {kind}")
 
 
 def alphas_cumprod_from_betas(betas: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Given betas, return (alphas, alphas_cumprod).
-    """
+    """Return alphas[t] and alpha_bar[t] (cumprod of alphas)."""
+    betas = betas.to(dtype=torch.float32)
     alphas = 1.0 - betas
-    alphas_cumprod = torch.cumprod(alphas, dim=0)
-    return alphas, alphas_cumprod
+    alpha_bar = torch.cumprod(alphas, dim=0)
+    return alphas, alpha_bar
 
 
-# ---------------------------
-# Index extract helper
-# ---------------------------
+# ----------------------------
+# Timestep embedding (sinusoidal)
+# ----------------------------
 
-def _extract_at(tensor_1d: torch.Tensor, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+def timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
     """
-    Gather values from a 1D tensor by timestep indices `t` and reshape to match `x`.
-    """
-    out = tensor_1d.gather(0, t.clamp(min=0, max=tensor_1d.numel() - 1))
-    # reshape to broadcast: [B, 1, 1, ...]
-    while out.dim() < x.dim():
-        out = out.unsqueeze(-1)
-    return out.to(x.dtype).to(x.device)
+    Create sinusoidal timestep embeddings.
 
-
-# ---------------------------
-# Forward (q_sample)
-# ---------------------------
-
-def q_sample(z0: torch.Tensor,
-             t: torch.Tensor,
-             alphas_cumprod: torch.Tensor,
-             noise: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Sample q(z_t | z0) = sqrt(a_bar_t) z0 + sqrt(1 - a_bar_t) eps
     Args:
-      z0: clean latent [...]; dtype/device define outputs
-      t:  [B] integer timesteps (0..T-1)
-      alphas_cumprod: [T] cumulative alphas
-      noise: optional noise tensor ~ N(0, I) (same shape as z0)
+      timesteps: int tensor of shape [B]
+      dim: embedding dimension (even number recommended)
+      max_period: controls the minimum frequency of the embeddings
+
     Returns:
-      (z_t, eps_used)
+      Tensor of shape [B, dim]
     """
-    if noise is None:
-        noise = torch.randn_like(z0)
-    a_bar = _extract_at(alphas_cumprod, t, z0)
-    z_t = torch.sqrt(a_bar) * z0 + torch.sqrt(1.0 - a_bar) * noise
-    return z_t, noise
+    if timesteps.dtype != torch.float32 and timesteps.dtype != torch.float64:
+        timesteps = timesteps.float()
+
+    half = dim // 2
+    freqs = torch.exp(-math.log(max_period) * torch.arange(0, half, dtype=torch.float32, device=timesteps.device) / half)
+    args = timesteps.unsqueeze(1) * freqs.unsqueeze(0)
+    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=1)
+    if dim % 2 == 1:
+        # pad one dimension if dim is odd
+        emb = torch.nn.functional.pad(emb, (0, 1))
+    return emb
 
 
-# ---------------------------
-# DDIM stepping
-# ---------------------------
+# ----------------------------
+# Forward noising q(x_t | x_0)
+# ----------------------------
 
-def ddim_step(z_t: torch.Tensor,
-              t: torch.Tensor,
-              t_prev: torch.Tensor,
-              eps_hat: torch.Tensor,
-              alphas_cumprod: torch.Tensor,
-              eta: float = 0.0) -> torch.Tensor:
+def _gather(a_bar: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
     """
-    One DDIM update from t -> t_prev (t_prev < t), vectorized over batch.
-
-    eta=0 => deterministic DDIM
-    eta>0 => adds noise according to variance schedule
+    Gather alpha_bar[t] with broadcasting to match batch shape.
+    t: (B,) int64/long
+    returns: (B,) float32
     """
-    a_t   = _extract_at(alphas_cumprod, t, z_t)         # a_bar_t
-    a_tp  = _extract_at(alphas_cumprod, t_prev, z_t)    # a_bar_{t_prev}
+    if t.dtype != torch.long:
+        t = t.long()
+    return a_bar[t]
 
-    # Predict x0
-    x0_hat = (z_t - torch.sqrt(1.0 - a_t) * eps_hat) / torch.sqrt(a_t).clamp(min=1e-12)
 
-    # Direction to x_t
-    sigma = eta * torch.sqrt((1 - a_tp) / (1 - a_t) * (1 - a_t / a_tp)).clamp(min=0.0)
-    noise = torch.randn_like(z_t) if eta > 0 else torch.zeros_like(z_t)
+def q_sample(
+    x0: torch.Tensor,
+    t: torch.Tensor,
+    alpha_bar: torch.Tensor,
+    eps: torch.Tensor | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Sample x_t = sqrt(ā_t) * x0 + sqrt(1 - ā_t) * epsilon.
+    Returns (x_t, epsilon_used).
+    """
+    B = t.shape[0]
+    a_bar_t = _gather(alpha_bar, t)                     # (B,)
+    while a_bar_t.dim() < x0.dim():
+        a_bar_t = a_bar_t.unsqueeze(-1)                 # (B,1,1,...)
+    sqrt_ab = torch.sqrt(a_bar_t)
+    sqrt_omb = torch.sqrt(torch.clamp(1.0 - a_bar_t, min=0.0))
 
-    z_prev = torch.sqrt(a_tp) * x0_hat + torch.sqrt(1 - a_tp - sigma ** 2) * eps_hat + sigma * noise
-    return z_prev
+    if eps is None:
+        eps = torch.randn_like(x0)
 
+    x_t = sqrt_ab * x0 + sqrt_omb * eps
+    return x_t, eps
+
+
+# ----------------------------
+# DDIM sampling utilities
+# ----------------------------
 
 def make_sampling_schedule(T_train: int, T_sample: int) -> torch.Tensor:
     """
-    Uniformly spaced timesteps from T_train-1 down to 0, length T_sample.
-    Returns: [T_sample] int64
+    Create a decreasing integer schedule of length T_sample+1 from (T_train-1) to -1.
+    E.g., for T_train=1000, T_sample=10, you get 11 integers:
+      [999, ~899, ..., ~0, -1]
     """
-    if T_sample <= 1:
-        return torch.tensor([T_train - 1], dtype=torch.long)
-    return torch.linspace(T_train - 1, 0, steps=T_sample, dtype=torch.long)
+    grid = torch.linspace(T_train - 1, -1, T_sample + 1)
+    # Round to nearest integer and cast to long
+    sched = torch.round(grid).to(torch.long)
+    # Ensure strictly non-increasing
+    sched = torch.minimum(sched, torch.arange(T_sample, -1, -1, dtype=torch.long) * 0 + sched[0])
+    return sched
 
 
-# ---------------------------
-# Timestep embedding (sinusoidal)
-# ---------------------------
-
-def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
+def ddim_step(
+    x_t: torch.Tensor,          # current sample at time t
+    t_now: torch.Tensor,        # (B,) current integer timestep
+    t_prev: torch.Tensor,       # (B,) previous integer timestep (can be -1)
+    eps_hat: torch.Tensor,      # predicted noise ε̂(x_t, t)
+    alpha_bar: torch.Tensor,    # ā[t] vector for all t
+    eta: float = 0.0,
+) -> torch.Tensor:
     """
-    Sinusoidal embedding for scalar timesteps (like in diffusion/transformers).
-    Args:
-      t: [B] or any shape broadcastable to [B]
-      dim: embedding dimension (even)
-    Returns:
-      emb: [B, dim]
+    One DDIM update x_{t_prev} from x_t.
+
+    Formulas (see DDIM paper; Nichol & Dhariwal re-derivation):
+      x0_pred = (x_t - sqrt(1 - ā_t) * eps_hat) / sqrt(ā_t)
+      sigma_t = eta * sqrt((1 - ā_{t-1})/(1 - ā_t) * (1 - ā_t/ā_{t-1}))
+      x_{t-1} = sqrt(ā_{t-1}) * x0_pred
+                + sqrt(1 - ā_{t-1} - sigma_t^2) * eps_hat
+                + sigma_t * z,  z~N(0,I)
+    We handle t_prev = -1 by setting ā_{-1} = 1.
     """
-    half = dim // 2
-    freqs = torch.exp(-math.log(max_period) * torch.arange(0, half, dtype=torch.float32, device=t.device) / half)
-    args = t.float().unsqueeze(-1) * freqs  # [B, half]
-    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    if dim % 2 == 1:  # pad if odd
-        emb = torch.nn.functional.pad(emb, (0, 1))
-    return emb
-#!/usr/bin/env python3
-"""
-schedule_utils.py — diffusion schedules, q_sample, and DDIM stepping.
-"""
+    # Gather ā_t and ā_{t-1}
+    a_t = _gather(alpha_bar, torch.clamp(t_now, min=0))
+    a_prev = torch.where(
+        (t_prev >= 0), _gather(alpha_bar, torch.clamp(t_prev, min=0)), torch.ones_like(a_t)
+    )  # ā_{-1} = 1
 
-from __future__ import annotations
-from typing import Literal, Tuple
+    # Broadcast to x_t shape
+    def bcast(v: torch.Tensor) -> torch.Tensor:
+        while v.dim() < x_t.dim():
+            v = v.unsqueeze(-1)
+        return v
 
-import math
-import torch
+    sqrt_a_t = torch.sqrt(bcast(a_t))
+    sqrt_omb_t = torch.sqrt(torch.clamp(1.0 - bcast(a_t), min=0.0))
+    sqrt_a_prev = torch.sqrt(bcast(a_prev))
 
+    # Predict x0
+    x0_pred = (x_t - sqrt_omb_t * eps_hat) / torch.clamp(sqrt_a_t, min=1e-8)
 
-ScheduleKind = Literal["linear", "cosine", "sigmoid"]
-
-
-# ---------------------------
-# Beta schedules
-# ---------------------------
-
-def make_beta_schedule(steps: int,
-                       kind: ScheduleKind = "cosine",
-                       min_beta: float = 1e-4,
-                       max_beta: float = 2e-2,
-                       s: float = 0.008) -> torch.Tensor:
-    """
-    Create a beta schedule (length = steps).
-
-    - linear: linspace(min_beta, max_beta)
-    - cosine: Nichol & Dhariwal (improved DDPM) via alpha_bar(t)
-    - sigmoid: smooth start/end using a logistic in log-beta space
-    """
-    device = torch.device("cpu")
-
-    if kind == "linear":
-        betas = torch.linspace(min_beta, max_beta, steps, device=device)
-
-    elif kind == "cosine":
-        # alpha_bar(t) = cos^2( (t/T + s)/(1+s) * pi/2 )
-        ts = torch.linspace(0, steps, steps + 1, device=device)
-        f = (ts / steps + s) / (1 + s)
-        alpha_bar = torch.cos(f * math.pi / 2) ** 2
-        betas = torch.clamp(1 - (alpha_bar[1:] / alpha_bar[:-1]), min=min_beta, max=max_beta)
-
-    elif kind == "sigmoid":
-        # Interpolate betas in log-space with a sigmoid ramp
-        t = torch.linspace(-6, 6, steps, device=device)
-        sig = torch.sigmoid(t)
-        betas = (min_beta + (max_beta - min_beta) * sig)
-
+    # Sigma for DDIM (eta=0 => deterministic)
+    if eta > 0.0:
+        num = (1.0 - a_prev)
+        den = (1.0 - a_t)
+        frac = torch.clamp(num / torch.clamp(den, min=1e-8), min=0.0)
+        one_minus_ratio = torch.clamp(1.0 - (a_t / torch.clamp(a_prev, min=1e-8)), min=0.0)
+        sigma = eta * torch.sqrt(bcast(frac * one_minus_ratio))
     else:
-        raise ValueError(f"Unknown schedule kind: {kind}")
+        sigma = torch.zeros_like(x_t)
 
-    return betas.float()
+    # Second term coefficient
+    coeff_eps = torch.sqrt(torch.clamp(1.0 - bcast(a_prev) - sigma ** 2, min=0.0))
 
+    z = torch.randn_like(x_t) if eta > 0.0 else torch.zeros_like(x_t)
 
-def alphas_cumprod_from_betas(betas: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Given betas, return (alphas, alphas_cumprod).
-    """
-    alphas = 1.0 - betas
-    alphas_cumprod = torch.cumprod(alphas, dim=0)
-    return alphas, alphas_cumprod
-
-
-# ---------------------------
-# Index extract helper
-# ---------------------------
-
-def _extract_at(tensor_1d: torch.Tensor, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """
-    Gather values from a 1D tensor by timestep indices `t` and reshape to match `x`.
-    """
-    out = tensor_1d.gather(0, t.clamp(min=0, max=tensor_1d.numel() - 1))
-    # reshape to broadcast: [B, 1, 1, ...]
-    while out.dim() < x.dim():
-        out = out.unsqueeze(-1)
-    return out.to(x.dtype).to(x.device)
-
-
-# ---------------------------
-# Forward (q_sample)
-# ---------------------------
-
-def q_sample(z0: torch.Tensor,
-             t: torch.Tensor,
-             alphas_cumprod: torch.Tensor,
-             noise: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Sample q(z_t | z0) = sqrt(a_bar_t) z0 + sqrt(1 - a_bar_t) eps
-    Args:
-      z0: clean latent [...]; dtype/device define outputs
-      t:  [B] integer timesteps (0..T-1)
-      alphas_cumprod: [T] cumulative alphas
-      noise: optional noise tensor ~ N(0, I) (same shape as z0)
-    Returns:
-      (z_t, eps_used)
-    """
-    if noise is None:
-        noise = torch.randn_like(z0)
-    a_bar = _extract_at(alphas_cumprod, t, z0)
-    z_t = torch.sqrt(a_bar) * z0 + torch.sqrt(1.0 - a_bar) * noise
-    return z_t, noise
-
-
-# ---------------------------
-# DDIM stepping
-# ---------------------------
-
-def ddim_step(z_t: torch.Tensor,
-              t: torch.Tensor,
-              t_prev: torch.Tensor,
-              eps_hat: torch.Tensor,
-              alphas_cumprod: torch.Tensor,
-              eta: float = 0.0) -> torch.Tensor:
-    """
-    One DDIM update from t -> t_prev (t_prev < t), vectorized over batch.
-
-    eta=0 => deterministic DDIM
-    eta>0 => adds noise according to variance schedule
-    """
-    a_t   = _extract_at(alphas_cumprod, t, z_t)         # a_bar_t
-    a_tp  = _extract_at(alphas_cumprod, t_prev, z_t)    # a_bar_{t_prev}
-
-    # Predict x0
-    x0_hat = (z_t - torch.sqrt(1.0 - a_t) * eps_hat) / torch.sqrt(a_t).clamp(min=1e-12)
-
-    # Direction to x_t
-    sigma = eta * torch.sqrt((1 - a_tp) / (1 - a_t) * (1 - a_t / a_tp)).clamp(min=0.0)
-    noise = torch.randn_like(z_t) if eta > 0 else torch.zeros_like(z_t)
-
-    z_prev = torch.sqrt(a_tp) * x0_hat + torch.sqrt(1 - a_tp - sigma ** 2) * eps_hat + sigma * noise
-    return z_prev
-
-
-def make_sampling_schedule(T_train: int, T_sample: int) -> torch.Tensor:
-    """
-    Uniformly spaced timesteps from T_train-1 down to 0, length T_sample.
-    Returns: [T_sample] int64
-    """
-    if T_sample <= 1:
-        return torch.tensor([T_train - 1], dtype=torch.long)
-    return torch.linspace(T_train - 1, 0, steps=T_sample, dtype=torch.long)
-
-
-# ---------------------------
-# Timestep embedding (sinusoidal)
-# ---------------------------
-
-def timestep_embedding(t: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
-    """
-    Sinusoidal embedding for scalar timesteps (like in diffusion/transformers).
-    Args:
-      t: [B] or any shape broadcastable to [B]
-      dim: embedding dimension (even)
-    Returns:
-      emb: [B, dim]
-    """
-    half = dim // 2
-    freqs = torch.exp(-math.log(max_period) * torch.arange(0, half, dtype=torch.float32, device=t.device) / half)
-    args = t.float().unsqueeze(-1) * freqs  # [B, half]
-    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-    if dim % 2 == 1:  # pad if odd
-        emb = torch.nn.functional.pad(emb, (0, 1))
-    return emb
+    x_prev = sqrt_a_prev * x0_pred + coeff_eps * eps_hat + sigma * z
+    return x_prev

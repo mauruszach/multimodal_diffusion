@@ -2,24 +2,26 @@
 """
 preprocess_audio.py
 
-Loads audio files, (optionally) RMS-normalizes, computes log-mel spectrograms,
-and chunks them into clips. It can either:
-  1) Use fixed-duration windows (clip_seconds / hop_seconds), or
-  2) Align to a video's clips.json (exact start/end seconds per clip).
+Two modes:
 
-Outputs (per audio file):
-  out_root/
-    <basename>/
-      clips/
-        clip_0000.npz   # {'mel': [n_mels, T], 'sr': sr, ...}
-        clip_0001.npz
-      clips.json        # manifest with clip metadata (start/end, paths)
+  1) mode=wav (default): simple resample to 16 kHz mono and write WAV files,
+     mirroring the input directory structure. No chunking.
+     Usage:
+       python scripts/preprocess_audio.py \
+         --input_path data/audio/GRID/raw \
+         --output_dir data/audio/GRID/wav16k \
+         --sr 16000 --mode wav
 
-Dependencies:
-  - numpy
-  - librosa
-  - soundfile
-  - tqdm
+  2) mode=mel: compute log-mel spectrograms and save per-clip NPZ files
+     (keeps your original functionality; optional RMS norm and save_wav).
+     Usage:
+       python scripts/preprocess_audio.py \
+         --in data/audio/GRID/raw \
+         --out data/audio/GRID/mels \
+         --sr 16000 --mode mel --clip-seconds 3.0 --hop-seconds 1.0
+
+Both flag sets are accepted:
+  --in / --out   OR   --input_path / --output_dir
 """
 
 from __future__ import annotations
@@ -139,38 +141,27 @@ def save_clip_npz(
     np.savez_compressed(out_path, **out)
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Preprocess audio: log-mel features and clip chunking.")
-    ap.add_argument("--in", dest="in_dir", type=Path, required=True, help="Input dir with audio files")
-    ap.add_argument("--out", dest="out_dir", type=Path, required=True, help="Output root directory")
-    ap.add_argument("--glob", type=str, default="**/*", help="Glob for audio files (default: **/*)")
-
-    # Audio IO / normalization
-    ap.add_argument("--sr", type=int, default=16000, help="Target sample rate")
-    ap.add_argument("--norm-rms", action="store_true", help="Apply simple RMS normalization to waveform")
-    ap.add_argument("--save-wav", action="store_true", help="Also save per-clip waveform into the .npz")
-
-    # Windowing / alignment
-    ap.add_argument("--clip-seconds", type=float, default=3.0, help="Clip duration (seconds)")
-    ap.add_argument("--hop-seconds", type=float, default=1.0, help="Hop between clips (seconds)")
-    ap.add_argument("--align-to", type=Path, default=None, help="Path to video clips.json to align windows")
-
-    # Mel config
-    ap.add_argument("--n-mels", type=int, default=64, help="Number of mel bins")
-    ap.add_argument("--n-fft", type=int, default=1024, help="FFT size")
-    ap.add_argument("--hop-length", type=int, default=256, help="STFT hop length (samples)")
-    ap.add_argument("--win-length", type=int, default=None, help="STFT window length (samples); default=n_fft")
-    ap.add_argument("--fmin", type=float, default=20.0, help="Mel fmin")
-    ap.add_argument("--fmax", type=float, default=None, help="Mel fmax (default: sr/2)")
-    ap.add_argument("--center", action="store_true", help="Center STFT frames (librosa center=True)")
-    args = ap.parse_args()
-
-    audio_files = [p for p in args.in_dir.glob(args.glob) if p.suffix.lower() in AUDIO_EXTS and p.is_file()]
+def resample_wavs(in_dir: Path, out_dir: Path, sr: int, norm_rms: bool = False) -> None:
+    audio_files = [p for p in in_dir.rglob("*") if p.suffix.lower() in AUDIO_EXTS and p.is_file()]
     if not audio_files:
-        print(f"[WARN] No audio files found under {args.in_dir} (glob: {args.glob})")
+        print(f"[WARN] No audio files found under {in_dir}")
         return
+    for src in tqdm(audio_files, desc=f"[resample] {in_dir}", unit="file"):
+        rel = src.relative_to(in_dir)
+        dst = out_dir / rel.with_suffix(".wav")  # always write .wav
+        ensure_dir(dst.parent)
+        y = load_audio(src, sr=sr, mono=True)
+        if norm_rms:
+            y = rms_norm(y)
+        sf.write(dst, y, sr)
+    print(f"[OK] wrote resampled WAVs under {out_dir}")
 
-    ensure_dir(args.out_dir)
+
+def mel_mode(in_dir: Path, out_dir: Path, args) -> None:
+    audio_files = [p for p in in_dir.rglob("*") if p.suffix.lower() in AUDIO_EXTS and p.is_file()]
+    if not audio_files:
+        print(f"[WARN] No audio files found under {in_dir} (glob: **/*)")
+        return
 
     align_manifest = read_clip_manifest(args.align_to)
     use_alignment = align_manifest is not None
@@ -185,17 +176,15 @@ def main():
 
     for apath in audio_files:
         base = apath.stem
-        out_dir = args.out_dir / base
-        clips_dir = out_dir / "clips"
-        ensure_dir(out_dir)
+        out_base_dir = out_dir / base
+        clips_dir = out_base_dir / "clips"
+        ensure_dir(out_base_dir)
         ensure_dir(clips_dir)
 
-        # Load & normalize
         y = load_audio(apath, sr=args.sr, mono=True)
         if args.norm_rms:
             y = rms_norm(y)
 
-        # Decide ranges
         if use_alignment:
             ranges = [(int(round(s * args.sr)), int(round(e * args.sr))) for (s, e) in clip_windows]
         else:
@@ -217,13 +206,11 @@ def main():
             "clips": [],
         }
 
-        with tqdm(total=len(ranges), desc=f"[audio] {base}", unit="clip") as pbar:
+        with tqdm(total=len(ranges), desc=f"[mel] {base}", unit="clip") as pbar:
             for ci, (a, b) in enumerate(ranges):
-                a = max(0, a)
-                b = min(len(y), b)
+                a = max(0, a); b = min(len(y), b)
                 if b <= a:
-                    pbar.update(1)
-                    continue
+                    pbar.update(1); continue
 
                 y_clip = y[a:b].copy()
                 mel = compute_logmel(
@@ -270,9 +257,49 @@ def main():
                 })
                 pbar.update(1)
 
-        with open(out_dir / "clips.json", "w") as f:
+        with open(out_base_dir / "clips.json", "w") as f:
             json.dump(manifest, f, indent=2)
-        print(f"[OK] wrote {out_dir / 'clips.json'}  | clips: {len(manifest['clips'])}")
+        print(f"[OK] wrote {out_base_dir / 'clips.json'}  | clips: {len(manifest['clips'])}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Audio preprocessing: resample WAVs or log-mel NPZ clips.")
+    # Accept both old and new flag names
+    ap.add_argument("--in", dest="in_dir", type=Path, help="Input root directory (audio files)")
+    ap.add_argument("--out", dest="out_dir", type=Path, help="Output root directory")
+    ap.add_argument("--input_path", dest="in_dir_alt", type=Path, help="(alias) input root dir")
+    ap.add_argument("--output_dir", dest="out_dir_alt", type=Path, help="(alias) output root dir")
+
+    ap.add_argument("--mode", choices=["wav", "mel"], default="wav", help="Resample to WAVs or write log-mel NPZs")
+    ap.add_argument("--glob", type=str, default="**/*", help="File glob (default: **/*)")
+    ap.add_argument("--sr", type=int, default=16000, help="Target sample rate")
+    ap.add_argument("--norm-rms", action="store_true", help="RMS-normalize waveform (both modes)")
+
+    # Mel-specific args (kept from original)
+    ap.add_argument("--save-wav", action="store_true", help="[mel] Also save per-clip waveform into the .npz")
+    ap.add_argument("--clip-seconds", type=float, default=3.0, help="[mel] Clip duration (seconds)")
+    ap.add_argument("--hop-seconds", type=float, default=1.0, help="[mel] Hop between clips (seconds)")
+    ap.add_argument("--align-to", type=Path, default=None, help="[mel] Path to video clips.json to align windows")
+
+    ap.add_argument("--n-mels", type=int, default=64, help="[mel] Number of mel bins")
+    ap.add_argument("--n-fft", type=int, default=1024, help="[mel] FFT size")
+    ap.add_argument("--hop-length", type=int, default=256, help="[mel] STFT hop length (samples)")
+    ap.add_argument("--win-length", type=int, default=None, help="[mel] STFT window length (samples)")
+    ap.add_argument("--fmin", type=float, default=20.0, help="[mel] Mel fmin")
+    ap.add_argument("--fmax", type=float, default=None, help="[mel] Mel fmax (default: sr/2)")
+    ap.add_argument("--center", action="store_true", help="[mel] Center STFT frames (librosa center=True)")
+    args = ap.parse_args()
+
+    in_dir = args.in_dir or args.in_dir_alt
+    out_dir = args.out_dir or args.out_dir_alt
+    if in_dir is None or out_dir is None:
+        ap.error("Please provide --in/--out or --input_path/--output_dir")
+
+    if args.mode == "wav":
+        resample_wavs(in_dir, out_dir, sr=args.sr, norm_rms=args.norm_rms)
+    else:
+        ensure_dir(out_dir)
+        mel_mode(in_dir, out_dir, args)
 
 
 if __name__ == "__main__":

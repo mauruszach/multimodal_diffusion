@@ -1,0 +1,71 @@
+# ---- OS / editor ----
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
+.python-version
+.venv/
+.env
+.env.*
+
+# ---- Testing / coverage ----
+.pytest_cache/
+.coverage*
+htmlcov/
+
+# ---- Notebooks ----
+.ipynb_checkpoints/
+
+# ---- Logs / checkpoints / TB ----
+runs/
+logs/
+checkpoints/
+*.tfevents.*
+*.pt
+*.ckpt
+
+# ---- Data (generated/large) ----
+# Raw/processed datasets and intermediates
+# Keep a tiny sample separately if needed (e.g., samples/)
+data/**/frames*/
+data/**/clips/
+data/**/wav*/
+data/**/*.npz
+# Common media formats
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.bmp
+*.gif
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.wav
+*.flac
+*.mp3
+
+# ---- Downloads / archives ----
+downloads/
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# ---- Build / cache ----
+build/
+dist/
+*.log
+
+# ---- Optional: ignore local config overrides ----
+# configs/local/*.yaml

@@ -1,0 +1,147 @@
+# ========= av_diffusion : MVP (MPS-ready) =========
+experiment: "av_mvp_mps"
+seed: 42
+device: "mps"              # Apple Silicon; use "cuda" on NVIDIA
+mixed_precision: "fp32"    # safest on MPS
+
+paths:
+  video_root: "data/video"
+  audio_root: "data/audio"
+  out_root:  "runs/av_mvp"
+  ckpt_dir:  "runs/av_mvp/checkpoints"
+  log_dir:   "runs/av_mvp/logs"
+  samples_dir: "runs/av_mvp/samples"
+
+data:
+  # we built a single manifest for s1–s4
+  train_split_glob: "data/GRID/clips.json"
+  val_split_glob:   "data/GRID/clips.json"
+
+  # loader/runtime
+  clip_seconds: 3.0
+  hop_seconds: 1.0
+  num_workers: 2
+  pin_memory: false
+  prefetch_factor: 2
+  batch_size: 1            # per device
+  grad_accum_steps: 4      # effective batch = 4
+
+video:
+  fps: 16
+  size: [128, 128]
+  latent:
+    channels: 8            # C'_v
+    t_down: 4              # T' = 48/4 = 12
+    s_down: 8              # H',W' = 128/8 = 16
+
+audio:
+  sr: 16000
+  representation: "codec"
+  codec:
+    hop_samples: 320       # 20 ms
+    hidden: 64
+    smooth_kernel: 7
+  latent:
+    channels: 8
+    frames_per_clip: 150   # 3.0 s / 0.02 s ≈ 150
+
+tokenizer:
+  width: 512
+  video:
+    tube:
+      t: 2                 # 8 * 2 * 4 * 4 = 256 per token
+      h: 4
+      w: 4
+  audio:
+    chunk:
+      length: 4            # 8 * 4 = 32 per token
+      stride: 4
+
+embeddings:
+  use_modality_embed: true
+  posenc:
+    video: "learned_3d"
+    audio: "learned_1d"
+  timestep_embed: "sinusoidal"
+  timestep_dim: 256
+
+model:
+  core:                     # scaled down for MPS
+    d_model: 512
+    n_layers: 8
+    n_heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.1
+    attn_dropout: 0.0
+    norm: "rmsnorm"
+    rope: false
+    token_dropout: 0.0
+
+  heads:
+    video:
+      out_dim: 256
+      hidden_dim: 512
+      num_layers: 2
+      dropout: 0.1
+      activation: "gelu"
+    audio:
+      out_dim: 32
+      hidden_dim: 512
+      num_layers: 2
+      dropout: 0.1
+      activation: "gelu"
+
+diffusion:
+  video:
+    steps: 1000
+    sampler_steps: 25
+    schedule: "cosine"
+    min_beta: 1.0e-4
+    max_beta: 0.02
+  audio:
+    steps: 1000
+    sampler_steps: 25
+    schedule: "cosine"
+    min_beta: 1.0e-4
+    max_beta: 0.02
+
+training:
+  any2any_targets:
+    video: 0.5              # A→V
+    audio: 0.5              # V→A
+
+  cfg_drop_prob: 0.1
+  align_loss_weight: 0.0
+
+  optimizer:
+    name: "adamw"
+    lr: 3.0e-4
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+    eps: 1.0e-8
+
+  scheduler:
+    name: "cosine"
+    warmup_steps: 1000
+
+  max_steps: 200000
+  val_every: 1000
+  log_every: 50
+  ckpt_every: 5000
+  grad_clip_norm: 1.0
+  ema:
+    use_ema: true
+    decay: 0.999
+
+sampling:
+  ddim_eta: 0.0
+  guidance_scale:
+    video: 3.0
+    audio: 3.0
+  prompt_modality: "video"
+
+streaming:
+  enabled: true
+  window_seconds: 3.0
+  hop_seconds: 1.0
+  crossfade_seconds: 0.25

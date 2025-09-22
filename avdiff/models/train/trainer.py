@@ -20,9 +20,9 @@ from torch.utils.tensorboard import SummaryWriter
 from avdiff.utils.io import ensure_dir, save_torch
 from avdiff.utils import ops
 from avdiff.utils import schedule_utils as su
-from avdiff.train.losses import mse_targets_only, alignment_loss
-from avdiff.train.collate import collate_batch
-from avdiff.train.mask_schedule import Any2AnySchedule
+from .losses import mse_targets_only, alignment_loss
+from .collate import collate_batch
+from .mask_schedule import Any2AnySchedule
 
 # expected model modules
 from avdiff.models.encoders.vae_video3d import VideoVAE
@@ -43,8 +43,10 @@ class LinearAdapter(torch.nn.Module):
 
 
 def add_sinusoidal_timestep(tokens: torch.Tensor, t_scalar: torch.Tensor, dim: int) -> torch.Tensor:
-    emb = su.timestep_embedding(t_scalar, dim=dim).to(tokens.device)
-    return tokens + emb.unsqueeze(1)  # add (assumes tokens already width d and last dim matches)
+    # Ensure embedding width matches token width to avoid config mismatches
+    d_tok = tokens.size(-1)
+    emb = su.timestep_embedding(t_scalar, dim=d_tok).to(tokens.device)
+    return tokens + emb.unsqueeze(1)
 
 
 class EMA:
@@ -62,6 +64,17 @@ class EMA:
 
     def copy_to(self, module: torch.nn.Module):
         module.load_state_dict(self.shadow, strict=False)
+
+
+# Picklable collate wrapper (avoids local lambda which breaks multiprocessing pickling)
+class CollateFn:
+    def __init__(self, T_target: int, L_target: int, schedule: Any2AnySchedule):
+        self.T_target = T_target
+        self.L_target = L_target
+        self.schedule = schedule
+
+    def __call__(self, items):
+        return collate_batch(items, T_target=self.T_target, L_target=self.L_target, pick_target=self.schedule.sample_target())
 
 
 # ---------- trainer ----------
@@ -107,17 +120,21 @@ class AVTrainer:
         else:
             sampler = None
 
-        self.loader = DataLoader(
-            dataset_train,
+        num_workers = int(cfg["data"]["num_workers"])
+        dl_kwargs = dict(
             batch_size=int(cfg["data"]["batch_size"]),
             shuffle=(sampler is None),
             sampler=sampler,
-            num_workers=int(cfg["data"]["num_workers"]),
+            num_workers=num_workers,
             pin_memory=bool(cfg["data"]["pin_memory"]),
-            prefetch_factor=int(cfg["data"].get("prefetch_factor", 2)),
-            collate_fn=lambda items: collate_batch(items, T_target=collate_T, L_target=collate_L, pick_target=self.schedule.sample_target()),
+            collate_fn=CollateFn(collate_T, collate_L, self.schedule),
             drop_last=True,
         )
+        # torch DataLoader only uses prefetch_factor when num_workers > 0
+        if num_workers > 0:
+            dl_kwargs["prefetch_factor"] = int(cfg["data"].get("prefetch_factor", 2))
+
+        self.loader = DataLoader(dataset_train, **dl_kwargs)
 
         self.loader_val = None  # (left for the user to wire if desired)
 
@@ -204,6 +221,7 @@ class AVTrainer:
             max_beta=cfg["diffusion"]["video"]["max_beta"],
         )
         _, self.a_bar_v = su.alphas_cumprod_from_betas(betas_v)
+        self.a_bar_v = self.a_bar_v.to(self.device)
 
         # Audio
         self.T_a = int(cfg["diffusion"]["audio"]["steps"])
@@ -214,6 +232,7 @@ class AVTrainer:
             max_beta=cfg["diffusion"]["audio"]["max_beta"],
         )
         _, self.a_bar_a = su.alphas_cumprod_from_betas(betas_a)
+        self.a_bar_a = self.a_bar_a.to(self.device)
 
     # ---- train step ----
 
@@ -266,7 +285,12 @@ class AVTrainer:
             audio = batch["audio"].to(self.device) if batch["audio"] is not None else None  # [B,1,L]
             has_v = batch["has_video"].to(self.device)
             has_a = batch["has_audio"].to(self.device)
-            target = batch["target"]
+            # Normalize target to a string ('video' or 'audio')
+            tgt = batch["target"]
+            if isinstance(tgt, set):
+                target = next(iter(tgt)) if len(tgt) > 0 else "audio"
+            else:
+                target = str(tgt)
 
             B = has_v.size(0)
 

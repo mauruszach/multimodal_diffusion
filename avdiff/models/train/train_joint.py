@@ -3,10 +3,10 @@
 train_joint.py — entrypoint to train the joint A↔V diffusion model.
 
 Launch (single GPU):
-  python -m avdiff.train.train_joint --config configs/mvp.yaml
+  python -m avdiff.models.train.train_joint --config configs/mvp.yaml
 
 Launch (DDP, 4 GPUs):
-  torchrun --nproc_per_node=4 -m avdiff.train.train_joint --config configs/mvp.yaml
+  torchrun --nproc_per_node=4 -m avdiff.models.train.train_joint --config configs/mvp.yaml
 """
 
 from __future__ import annotations
@@ -19,11 +19,10 @@ import torch.distributed as dist
 from torch.utils.data import Dataset
 
 from avdiff.utils.io import load_config
-from avdiff.train.trainer import AVTrainer
+from .trainer import AVTrainer
 
-# You should implement this dataset; here we import a stub name.
-# It should yield dicts with "video": [3,T,H,W] float in [0,1], "audio": [1,L] float.
-from avdiff.datasets.av_manifest import AVClipsDataset  # <-- implement in your repo
+# Dataset yields dicts with "video": [3,T,H,W] float in [0,1], "audio": [1,L] float.
+from avdiff.datasets.av_manifest import AVClipsDataset
 
 
 def setup_ddp():
@@ -46,16 +45,15 @@ def main():
     cfg = load_config(*args.config)
     rank, world = setup_ddp()
 
-    # Build datasets
+    # Build datasets (manifest-based)
     train_ds = AVClipsDataset(
+        manifest_path=cfg["data"]["train_split_glob"],
         video_root=cfg["paths"]["video_root"],
         audio_root=cfg["paths"]["audio_root"],
-        split_glob=cfg["data"]["train_split_glob"],
         fps=cfg["video"]["fps"],
         sr=cfg["audio"]["sr"],
         clip_seconds=cfg["data"]["clip_seconds"],
-        hop_seconds=cfg["data"]["hop_seconds"],
-        size=tuple(cfg["video"]["size"]),
+        size_hw=tuple(cfg["video"]["size"]),
     )
     # (optional) val_ds = AVClipsDataset(...)
 

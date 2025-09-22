@@ -1,144 +1,120 @@
-# ========= av_diffusion : MVP base config =========
-# Base configuration for training the audio-visual diffusion model
-# All paths should be absolute or relative to the project root
-# Version: 1.0.0  # Follows semantic versioning (MAJOR.MINOR.PATCH)
-
-experiment: "av_mvp"
-seed: 42                  # Random seed for reproducibility
-device: "cuda"           # "cuda" | "cpu"
-mixed_precision: "bf16"   # "fp32" | "fp16" | "bf16" (recommended for Ampere+ GPUs)
+# ========= av_diffusion : MVP (MPS-ready) =========
+experiment: "av_mvp_mps"
+seed: 42
+device: "mps"              # switch to "cuda" on NVIDIA
+mixed_precision: "fp32"    # safest on MPS
 
 paths:
-  # Processed data locations (supports environment variables with ${VAR_NAME} syntax)
-  # Example: video_root: "${DATA_DIR}/video"
+  # These roots are mostly informational since the loader reads full paths
   video_root: "data/video"
   audio_root: "data/audio"
   out_root:  "runs/av_mvp"
-  ckpt_dir:  "${OUT_ROOT}/checkpoints"
-  log_dir:   "${OUT_ROOT}/logs"
-  samples_dir: "${OUT_ROOT}/samples"
+  ckpt_dir:  "runs/av_mvp/checkpoints"
+  log_dir:   "runs/av_mvp/logs"
+  samples_dir: "runs/av_mvp/samples"
 
 data:
-  # clip/windowing (should match your preprocessing)
+  # Single manifest (s1–s4) you built with tools/build_grid_manifest.py
+  train_split_glob: "data/GRID/clips.json"
+  val_split_glob:   "data/GRID/clips.json"
+
+  # loader/runtime
   clip_seconds: 3.0
   hop_seconds: 1.0
-
-  # splits (filenames or regex/globs resolved by your dataset loader)
-  train_split_glob: "**/clips/*"  # pair manifests by matching video/audio basename; loader decides
-  val_split_glob:   "**/clips/*"
-
-  # I/O
-  num_workers: 8
-  pin_memory: true
+  num_workers: 0           # macOS+MPS: start with 0 to avoid mp issues
+  pin_memory: false        # pinned RAM is CUDA-only
   prefetch_factor: 2
-  batch_size: 4          # per device
-  grad_accum_steps: 1
+  batch_size: 1            # per device (keep tiny on MPS)
+  grad_accum_steps: 4      # effective batch = 4
 
 video:
   fps: 16
-  size: [128, 128]       # H, W
-  # latentizer (3D VAE) target shape per 3s clip
-  # Ensure these values match your VAE architecture
+  size: [128, 128]         # H, W
   latent:
-    channels: 8          # C'_v: Number of channels in latent space
-    t_down: 4            # T' = T / t_down (time dimension downsampling)
-    s_down: 8            # H' = H / s_down; W' = W / s_down (spatial downsampling)
-    # Resulting latent shape: (C'=8, T'=T/4, H'=H/8, W'=W/8)
+    channels: 8            # C'_v
+    t_down: 4              # T' = T / 4 (48 -> 12)
+    s_down: 8              # H',W' = 128/8 = 16
 
 audio:
   sr: 16000
-  representation: "codec"   # "codec" | "mel"
-  # if "mel", these are the mel settings (must match preprocessing)
-  mel:
-    n_mels: 64
-    n_fft: 1024
-    hop_length: 256        # ~16 ms @ 16 kHz
-  # latentizer (codec) target shape per 3s clip
-  # Ensure these values match your audio VAE/encoder architecture
+  representation: "codec"   # raw WAV → simple codec (no mel dependency)
+  codec:
+    hop_samples: 320        # 20 ms
+    hidden: 64
+    smooth_kernel: 7
   latent:
-    channels: 8            # C'_a: Number of channels in audio latent space
-    frame_hop_ms: 16       # Hop size in milliseconds (≈ 187 frames for 3s @ 16ms hop)
-    frames_per_clip: 150   # Number of frames after any temporal striding
-    # Ensure: frames_per_clip * frame_hop_ms/1000 ≈ clip_seconds
+    channels: 8
+    frames_per_clip: 150    # 3.0 s / 0.02 s ≈ 150
 
 tokenizer:
-  width: 1024              # token embedding dim (d)
+  width: 512                # <-- match model.core.d_model below
 
   video:
     tube:
-      t: 2                 # t_p
-      h: 4                 # p (height)
-      w: 4                 # p (width)
-    # output tokens per clip: (T'/t) * (H'/h) * (W'/w)
+      t: 2                  # out_dim = 8 * 2 * 4 * 4 = 256
+      h: 4
+      w: 4
 
   audio:
     chunk:
-      length: 4            # l_chunk (frames of audio latent per token)
-      stride: 4            # stride (no overlap here)
-    # output tokens per clip: floor(frames_per_clip / stride)
+      length: 4             # out_dim = 8 * 4 = 32
+      stride: 4
 
 embeddings:
-  # learned modality/type embeddings added to tokens
   use_modality_embed: true
-  # positional encodings (3D for video; 1D for audio)
   posenc:
-    video: "learned_3d"   # "learned_3d" | "sinusoidal_3d"
-    audio: "learned_1d"   # "learned_1d" | "sinusoidal_1d"
-  # diffusion time embedding per modality
-  timestep_embed: "sinusoidal"  # "sinusoidal" | "mlp"
+    video: "learned_3d"
+    audio: "learned_1d"
+  timestep_embed: "sinusoidal"
   timestep_dim: 256
 
 model:
-  core:                    # Multimodal Diffusion Transformer (DiT-style)
-    d_model: 1024
-    n_layers: 16
-    n_heads: 16
+  core:
+    d_model: 512            # <-- kept small for MPS; equals tokenizer.width
+    n_layers: 8
+    n_heads: 8
     mlp_ratio: 4.0
     dropout: 0.1
     attn_dropout: 0.0
-    norm: "rmsnorm"       # "layernorm" | "rmsnorm"
-    rope: false           # rotary for 1D? leave false for simplicity
-    token_dropout: 0.0    # stochastic token drop (regularization)
+    norm: "rmsnorm"
+    rope: false
+    token_dropout: 0.0
 
-  heads:                   # per-modality noise heads (per token)
-    # NOTE: out_dim must equal per-token latent size
+  heads:
     video:
-      # out_dim = C'_v * t_p * h * w   (e.g., 8 * 2 * 4 * 4 = 256)
-      out_dim: 256
-      hidden_dim: 1024
+      out_dim: 256          # 8 * 2 * 4 * 4
+      hidden_dim: 512
       num_layers: 2
       dropout: 0.1
       activation: "gelu"
     audio:
-      # out_dim = C'_a * chunk_len     (e.g., 8 * 4 = 32)
-      out_dim: 32
-      hidden_dim: 1024
+      out_dim: 32           # 8 * 4
+      hidden_dim: 512
       num_layers: 2
       dropout: 0.1
       activation: "gelu"
 
 diffusion:
-  # separate schedules per modality (training uses per-modality t)
   video:
     steps: 1000
-    sampler_steps: 50     # DDIM/DPMSolver steps at inference
-    schedule: "cosine"    # "cosine" | "linear" | "sigmoid"
+    sampler_steps: 25
+    schedule: "cosine"
     min_beta: 1.0e-4
     max_beta: 0.02
   audio:
     steps: 1000
-    sampler_steps: 50
+    sampler_steps: 25
     schedule: "cosine"
     min_beta: 1.0e-4
     max_beta: 0.02
 
 training:
-  any2any_targets:         # probabilities for picking target set each step
-    video: 0.5             # A→V
-    audio: 0.5             # V→A
+  any2any_targets:
+    video: 0.5              # A→V
+    audio: 0.5              # V→A
 
-  cfg_drop_prob: 0.1       # probability to drop condition tokens (for CFG)
-  align_loss_weight: 0.0   # optional weak alignment across time (0.0 to disable)
+  cfg_drop_prob: 0.1
+  align_loss_weight: 0.0
 
   optimizer:
     name: "adamw"
@@ -161,15 +137,14 @@ training:
     decay: 0.999
 
 sampling:
-  # default clip-mode sampling params (can be overridden by a2v/v2a configs)
   ddim_eta: 0.0
   guidance_scale:
-    video: 3.0   # when video is target (A→V)
-    audio: 3.0   # when audio is target (V→A)
-  prompt_modality: "video"   # default; "video" or "audio"
+    video: 3.0
+    audio: 3.0
+  prompt_modality: "video"
 
 streaming:
   enabled: true
   window_seconds: 3.0
   hop_seconds: 1.0
-  crossfade_seconds: 0.25   # crossfade decode overlaps
+  crossfade_seconds: 0.25
